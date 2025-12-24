@@ -67,13 +67,48 @@ function crack(){
 function block-update(){
     green "Blocking auto-update..."
     
-    # 屏蔽更新服务器
-    if ! grep -q "127.0.0.1 www.aapanel.com" /etc/hosts; then
-        echo "127.0.0.1 www.aapanel.com" >> /etc/hosts
+    # 检测系统类型并安装 dnsmasq
+    if [ -f /etc/debian_version ]; then
+        # Debian/Ubuntu
+        if ! command -v dnsmasq &> /dev/null; then
+            green "Installing dnsmasq..."
+            apt update -y && apt install dnsmasq -y
+        fi
+    elif [ -f /etc/redhat-release ]; then
+        # CentOS/RHEL
+        if ! command -v dnsmasq &> /dev/null; then
+            green "Installing dnsmasq..."
+            yum install dnsmasq -y
+        fi
     fi
-    if ! grep -q "127.0.0.1 api.aapanel.com" /etc/hosts; then
-        echo "127.0.0.1 api.aapanel.com" >> /etc/hosts
+    
+    # 创建 dnsmasq 屏蔽配置
+    cat > /etc/dnsmasq.d/block-panel-update.conf << 'EOF'
+# Block aaPanel domains
+address=/aapanel.com/127.0.0.1
+
+# Block bt.cn domains
+address=/bt.cn/127.0.0.1
+EOF
+    
+    # 配置 dnsmasq 作为本地 DNS
+    if ! grep -q "listen-address=127.0.0.1" /etc/dnsmasq.conf; then
+        echo "listen-address=127.0.0.1" >> /etc/dnsmasq.conf
     fi
+    
+    # 设置系统使用本地 DNS
+    if [ -f /etc/resolv.conf ]; then
+        # 备份原始 resolv.conf
+        cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null
+        # 添加本地 DNS 到首位
+        if ! grep -q "nameserver 127.0.0.1" /etc/resolv.conf; then
+            sed -i '1i nameserver 127.0.0.1' /etc/resolv.conf
+        fi
+    fi
+    
+    # 启动并启用 dnsmasq
+    systemctl enable dnsmasq 2>/dev/null
+    systemctl restart dnsmasq 2>/dev/null
     
     # 清空并锁定更新脚本
     if [ -f /www/server/panel/script/update.py ]; then
@@ -87,15 +122,23 @@ function block-update(){
     chattr +i /www/server/panel/BT-Task 2>/dev/null
     
     green "Auto-update blocked successfully!"
+    green "Blocked: *.aapanel.com, *.bt.cn (all subdomains)"
 }
 
 # 恢复更新功能
 function unblock-update(){
     green "Unblocking auto-update..."
     
-    # 移除 hosts 屏蔽
-    sed -i '/127.0.0.1 www.aapanel.com/d' /etc/hosts
-    sed -i '/127.0.0.1 api.aapanel.com/d' /etc/hosts
+    # 删除 dnsmasq 屏蔽配置
+    rm -f /etc/dnsmasq.d/block-panel-update.conf
+    
+    # 重启 dnsmasq
+    systemctl restart dnsmasq 2>/dev/null
+    
+    # 恢复 resolv.conf（可选）
+    if [ -f /etc/resolv.conf.bak ]; then
+        cp /etc/resolv.conf.bak /etc/resolv.conf
+    fi
     
     # 解锁文件
     chattr -i /www/server/panel/script/update.py 2>/dev/null
@@ -103,6 +146,38 @@ function unblock-update(){
     chattr -i /www/server/panel/BT-Task 2>/dev/null
     
     green "Auto-update unblocked!"
+    green "Removed dnsmasq block rules"
+}
+
+# 关闭面板 HTTPS
+function disable-https(){
+    green "Disabling panel HTTPS..."
+    
+    # 删除 SSL 标记文件
+    rm -f /www/server/panel/data/ssl.pl
+    
+    # 删除 SSL 证书文件
+    rm -f /www/server/panel/ssl/certificate.pem
+    rm -f /www/server/panel/ssl/privateKey.pem
+    rm -rf /www/server/panel/ssl/*
+    
+    # 重启面板
+    /etc/init.d/bt restart
+    
+    green "Panel HTTPS disabled! You can now access via HTTP."
+}
+
+# 开启面板 HTTPS
+function enable-https(){
+    green "Enabling panel HTTPS..."
+    
+    # 创建 SSL 标记文件
+    echo "True" > /www/server/panel/data/ssl.pl
+    
+    # 重启面板
+    /etc/init.d/bt restart
+    
+    green "Panel HTTPS enabled!"
 }
 
 # 菜单
@@ -118,6 +193,8 @@ function start_menu(){
     green " 3. Crack only"
     green " 4. Block auto-update"
     green " 5. Unblock auto-update"
+    green " 6. Disable panel HTTPS (use HTTP)"
+    green " 7. Enable panel HTTPS"
     yellow ""
     green " 0. Exit"
     yellow ""
@@ -127,10 +204,11 @@ function start_menu(){
         1 )
             install-official
             downgrade
+            disable-https
             yellow ""
             yellow "=========================================="
             red "IMPORTANT: To complete setup, please:"
-            red "1. Open aaPanel in your browser"
+            red "1. Open aaPanel in your browser (HTTP)"
             red "2. Go to App Store"
             red "3. Run this script again, select option 3 (Crack)"
             red "4. Run this script again, select option 4 (Block update)"
@@ -148,6 +226,12 @@ function start_menu(){
             ;;
         5 )
             unblock-update
+            ;;
+        6 )
+            disable-https
+            ;;
+        7 )
+            enable-https
             ;;
         0 )
             exit 0
