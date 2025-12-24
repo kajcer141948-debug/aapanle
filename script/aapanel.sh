@@ -63,52 +63,96 @@ function crack(){
     green "Crack completed."
 }
 
+# 修复 apt 源
+function fix-apt-source(){
+    if [ -f /etc/debian_version ]; then
+        green "Fixing apt sources..."
+        
+        # 获取 Debian 版本代号
+        if [ -f /etc/os-release ]; then
+            . /etc/os-release
+            CODENAME=$VERSION_CODENAME
+        fi
+        
+        # 修复常见的源问题
+        if [ -f /etc/apt/sources.list ]; then
+            # 修复 mirrors.edge.kernel.org 问题
+            sed -i 's|http://mirrors.edge.kernel.org/debian-security|http://deb.debian.org/debian-security|g' /etc/apt/sources.list
+            sed -i 's|http://mirrors.edge.kernel.org/debian|http://deb.debian.org/debian|g' /etc/apt/sources.list
+            
+            # 修复其他常见镜像问题
+            sed -i 's|http://security.debian.org/debian-security|http://deb.debian.org/debian-security|g' /etc/apt/sources.list
+        fi
+        
+        green "Apt sources fixed."
+    fi
+}
+
 # 步骤4: 屏蔽自动更新
 function block-update(){
     green "Blocking auto-update..."
     
+    DNSMASQ_OK=0
+    
     # 检测系统类型并安装 dnsmasq
-    if [ -f /etc/debian_version ]; then
-        # Debian/Ubuntu
-        if ! command -v dnsmasq &> /dev/null; then
-            green "Installing dnsmasq..."
-            apt update -y && apt install dnsmasq -y
+    if ! command -v dnsmasq &> /dev/null; then
+        green "Installing dnsmasq..."
+        if [ -f /etc/debian_version ]; then
+            # 先尝试修复 apt 源
+            fix-apt-source
+            apt update -y && apt install dnsmasq -y && DNSMASQ_OK=1
+        elif [ -f /etc/redhat-release ]; then
+            yum install dnsmasq -y && DNSMASQ_OK=1
         fi
-    elif [ -f /etc/redhat-release ]; then
-        # CentOS/RHEL
-        if ! command -v dnsmasq &> /dev/null; then
-            green "Installing dnsmasq..."
-            yum install dnsmasq -y
-        fi
+    else
+        DNSMASQ_OK=1
     fi
     
-    # 创建 dnsmasq 屏蔽配置
-    cat > /etc/dnsmasq.d/block-panel-update.conf << 'EOF'
+    # 如果 dnsmasq 安装成功，使用 dnsmasq 方式
+    if [ "$DNSMASQ_OK" = "1" ] && [ -d /etc/dnsmasq.d ]; then
+        green "Using dnsmasq method..."
+        
+        # 创建 dnsmasq 屏蔽配置
+        cat > /etc/dnsmasq.d/block-panel-update.conf << 'EOF'
 # Block aaPanel domains
 address=/aapanel.com/127.0.0.1
 
 # Block bt.cn domains
 address=/bt.cn/127.0.0.1
 EOF
-    
-    # 配置 dnsmasq 作为本地 DNS
-    if ! grep -q "listen-address=127.0.0.1" /etc/dnsmasq.conf; then
-        echo "listen-address=127.0.0.1" >> /etc/dnsmasq.conf
-    fi
-    
-    # 设置系统使用本地 DNS
-    if [ -f /etc/resolv.conf ]; then
-        # 备份原始 resolv.conf
-        cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null
-        # 添加本地 DNS 到首位
-        if ! grep -q "nameserver 127.0.0.1" /etc/resolv.conf; then
-            sed -i '1i nameserver 127.0.0.1' /etc/resolv.conf
+        
+        # 配置 dnsmasq 作为本地 DNS
+        if [ -f /etc/dnsmasq.conf ] && ! grep -q "listen-address=127.0.0.1" /etc/dnsmasq.conf; then
+            echo "listen-address=127.0.0.1" >> /etc/dnsmasq.conf
         fi
+        
+        # 设置系统使用本地 DNS
+        if [ -f /etc/resolv.conf ]; then
+            cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null
+            if ! grep -q "nameserver 127.0.0.1" /etc/resolv.conf; then
+                sed -i '1i nameserver 127.0.0.1' /etc/resolv.conf
+            fi
+        fi
+        
+        # 启动并启用 dnsmasq
+        systemctl enable dnsmasq 2>/dev/null
+        systemctl restart dnsmasq 2>/dev/null
+        
+        green "Blocked: *.aapanel.com, *.bt.cn (all subdomains via dnsmasq)"
+    else
+        # 回退到 hosts 方式
+        yellow "dnsmasq not available, using hosts file method..."
+        
+        DOMAINS="www.aapanel.com aapanel.com api.aapanel.com download.aapanel.com node.aapanel.com www.bt.cn bt.cn api.bt.cn download.bt.cn node.bt.cn update.bt.cn update1.bt.cn update2.bt.cn update3.bt.cn"
+        
+        for domain in $DOMAINS; do
+            if ! grep -q "127.0.0.1 $domain" /etc/hosts; then
+                echo "127.0.0.1 $domain" >> /etc/hosts
+            fi
+        done
+        
+        green "Blocked via /etc/hosts (common subdomains only)"
     fi
-    
-    # 启动并启用 dnsmasq
-    systemctl enable dnsmasq 2>/dev/null
-    systemctl restart dnsmasq 2>/dev/null
     
     # 清空并锁定更新脚本
     if [ -f /www/server/panel/script/update.py ]; then
@@ -122,7 +166,6 @@ EOF
     chattr +i /www/server/panel/BT-Task 2>/dev/null
     
     green "Auto-update blocked successfully!"
-    green "Blocked: *.aapanel.com, *.bt.cn (all subdomains)"
 }
 
 # 恢复更新功能
@@ -130,15 +173,19 @@ function unblock-update(){
     green "Unblocking auto-update..."
     
     # 删除 dnsmasq 屏蔽配置
-    rm -f /etc/dnsmasq.d/block-panel-update.conf
+    rm -f /etc/dnsmasq.d/block-panel-update.conf 2>/dev/null
     
     # 重启 dnsmasq
     systemctl restart dnsmasq 2>/dev/null
     
-    # 恢复 resolv.conf（可选）
+    # 恢复 resolv.conf
     if [ -f /etc/resolv.conf.bak ]; then
         cp /etc/resolv.conf.bak /etc/resolv.conf
     fi
+    
+    # 移除 hosts 中的屏蔽（如果使用了 hosts 方式）
+    sed -i '/127.0.0.1.*aapanel\.com/d' /etc/hosts
+    sed -i '/127.0.0.1.*bt\.cn/d' /etc/hosts
     
     # 解锁文件
     chattr -i /www/server/panel/script/update.py 2>/dev/null
@@ -146,7 +193,6 @@ function unblock-update(){
     chattr -i /www/server/panel/BT-Task 2>/dev/null
     
     green "Auto-update unblocked!"
-    green "Removed dnsmasq block rules"
 }
 
 # 关闭面板 HTTPS
@@ -195,6 +241,7 @@ function start_menu(){
     green " 5. Unblock auto-update"
     green " 6. Disable panel HTTPS (use HTTP)"
     green " 7. Enable panel HTTPS"
+    green " 8. Fix apt sources (Debian/Ubuntu)"
     yellow ""
     green " 0. Exit"
     yellow ""
@@ -232,6 +279,9 @@ function start_menu(){
             ;;
         7 )
             enable-https
+            ;;
+        8 )
+            fix-apt-source
             ;;
         0 )
             exit 0
